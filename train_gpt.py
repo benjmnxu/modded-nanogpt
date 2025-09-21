@@ -19,6 +19,14 @@ import torch.distributed as dist
 # use of FlexAttention contributed by @KoszarskyB
 from torch.nn.attention.flex_attention import BlockMask, flex_attention
 #torch._inductor.config.coordinate_descent_tuning = True # we have banned this flag for new records because it causes compilation to take 30min
+from datetime import timedelta
+
+# --- Stagger controls (env flags; default: off) ---
+STAGGER_ENABLE = os.environ.get("STAGGER_ENABLE", "0") == "1"
+STAGGER_DELAY_S = float(os.environ.get("STAGGER_DELAY_S", "2.0"))  # seconds between ranks
+STAGGER_WARMUP_STEPS = int(os.environ.get("STAGGER_WARMUP_STEPS", "40"))
+# modes: 'forward_only' (no grads), 'backward_noopt' (grads but no optimizer.step)
+STAGGER_MODE = os.environ.get("STAGGER_MODE", "forward_only")
 
 # -----------------------------------------------------------------------------
 # Custom operators: FP8 matmul by @YouJiacheng
@@ -575,9 +583,14 @@ assert world_size == 8 # this code is designed for 8xH100
 assert torch.cuda.is_available()
 device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
 torch.cuda.set_device(device)
-dist.init_process_group(backend="nccl", device_id=device)
+dist.init_process_group(backend="nccl", device_id=device, timeout=timedelta(minutes=10))
 dist.barrier()
 master_process = (rank == 0) # this process will do logging, checkpointing etc.
+# --- Tiered wall-clock ramp: rank i waits i * STAGGER_DELAY_S seconds ---
+if STAGGER_ENABLE:
+    if master_process:
+        print(f"[stagger] enabled: delay_s={STAGGER_DELAY_S}, warmup_steps={STAGGER_WARMUP_STEPS}, mode={STAGGER_MODE}")
+    time.sleep(STAGGER_DELAY_S * rank)
 
 # begin logging
 logfile = None
@@ -656,21 +669,46 @@ model: nn.Module = torch.compile(model, dynamic=False)
 #            Warmup kernels            #
 ########################################
 
-# Warmup the training kernels, then re-initialize the state so we aren't cheating
-warmup_steps = 10
-initial_state = dict(model=copy.deepcopy(model.state_dict()),
-                     optimizers=[copy.deepcopy(opt.state_dict()) for opt in optimizers]) # save the initial state
-train_loader = distributed_data_generator(args.train_files, world_size * args.train_seq_len, align_to_bos=True)
-for _ in range(warmup_steps):
-    inputs, targets = next(train_loader)
-    model(inputs, targets, get_window_size_blocks(1)).backward()
-    for opt in optimizers:
-        opt.step()
-    model.zero_grad(set_to_none=True)
-model.load_state_dict(initial_state["model"])
-for opt, opt_state in zip(optimizers, initial_state["optimizers"]):
-    opt.load_state_dict(opt_state)
-del train_loader, initial_state
+if STAGGER_ENABLE and STAGGER_WARMUP_STEPS > 0:
+    # Build a loader just to prime CUDA graphs/kernels/IO
+    warm_loader = distributed_data_generator(args.train_files, world_size * args.train_seq_len, align_to_bos=True)
+    model.train()
+    if master_process:
+        print(f"[stagger] rank {rank}: warmup start ({STAGGER_MODE}, steps={STAGGER_WARMUP_STEPS})")
+
+    for _ in range(STAGGER_WARMUP_STEPS):
+        inputs, targets = next(warm_loader)
+        if STAGGER_MODE == "forward_only":
+            with torch.no_grad():
+                _ = model(inputs, targets, get_window_size_blocks(1))
+        elif STAGGER_MODE == "backward_noopt":
+            # run backward to warm backward graphs/kernels, but DO NOT step optimizers
+            model(inputs, targets, get_window_size_blocks(1)).backward()
+            model.zero_grad(set_to_none=True)
+        else:
+            raise ValueError(f"Unknown STAGGER_MODE '{STAGGER_MODE}' (use 'forward_only' or 'backward_noopt')")
+
+    if master_process:
+        print(f"[stagger] rank {rank}: warmup end")
+
+    # Regroup all ranks once before real training begins
+    dist.barrier()
+else:
+    # Warmup the training kernels, then re-initialize the state so we aren't cheating
+    warmup_steps = 10
+    initial_state = dict(model=copy.deepcopy(model.state_dict()),
+                        optimizers=[copy.deepcopy(opt.state_dict()) for opt in optimizers]) # save the initial state
+    train_loader = distributed_data_generator(args.train_files, world_size * args.train_seq_len, align_to_bos=True)
+    for _ in range(warmup_steps):
+        inputs, targets = next(train_loader)
+        model(inputs, targets, get_window_size_blocks(1)).backward()
+        for opt in optimizers:
+            opt.step()
+        model.zero_grad(set_to_none=True)
+    model.load_state_dict(initial_state["model"])
+    for opt, opt_state in zip(optimizers, initial_state["optimizers"]):
+        opt.load_state_dict(opt_state)
+    del train_loader, initial_state
 
 ########################################
 #        Training and validation       #
