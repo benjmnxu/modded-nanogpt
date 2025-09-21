@@ -28,6 +28,10 @@ STAGGER_WARMUP_STEPS = int(os.environ.get("STAGGER_WARMUP_STEPS", "40"))
 # modes: 'forward_only' (no grads), 'backward_noopt' (grads but no optimizer.step)
 STAGGER_MODE = os.environ.get("STAGGER_MODE", "forward_only")
 
+TIERED_EXIT_ENABLE = os.environ.get("TIERED_EXIT_ENABLE", "0") == "1"
+TIERED_EXIT_BASE_STEPS = int(os.environ.get("TIERED_EXIT_BASE_STEPS", "0"))   # base delay in steps
+TIERED_EXIT_STRIDE_STEPS = int(os.environ.get("TIERED_EXIT_STRIDE_STEPS", "2"))  # extra delay per rank
+
 # -----------------------------------------------------------------------------
 # Custom operators: FP8 matmul by @YouJiacheng
 
@@ -669,6 +673,7 @@ model: nn.Module = torch.compile(model, dynamic=False)
 #            Warmup kernels            #
 ########################################
 
+exit_threshold_steps = 0
 if STAGGER_ENABLE and STAGGER_WARMUP_STEPS > 0:
     # Build a loader just to prime CUDA graphs/kernels/IO
     warm_loader = distributed_data_generator(args.train_files, world_size * args.train_seq_len, align_to_bos=True)
@@ -693,6 +698,12 @@ if STAGGER_ENABLE and STAGGER_WARMUP_STEPS > 0:
 
     # Regroup all ranks once before real training begins
     dist.barrier()
+    if TIERED_EXIT_ENABLE:
+        exit_threshold_steps = TIERED_EXIT_BASE_STEPS + rank * TIERED_EXIT_STRIDE_STEPS
+        if master_process:
+            print(f"[tiered-exit] enabled: base={TIERED_EXIT_BASE_STEPS} stride={TIERED_EXIT_STRIDE_STEPS}; "
+                f"rank {rank} will start optimizer at global step >= {exit_threshold_steps}")
+
 else:
     # Warmup the training kernels, then re-initialize the state so we aren't cheating
     warmup_steps = 10
@@ -766,11 +777,27 @@ for step in range(train_steps + 1):
     for group in optimizer2.param_groups:
         frac = min(step / 300, 1) # momentum warmup for muon
         group["momentum"] = (1 - frac) * 0.85 + frac * 0.95
-    # step the optimizers
-    for opt in optimizers:
-        opt.step()
-    # null the gradients
+    # --- Tiered-exit gating of collectives/optimizer ---
+    do_synced_step = True
+    if TIERED_EXIT_ENABLE:
+        # Only start optimizer (which triggers collectives) after this rank's threshold
+        do_synced_step = (step >= exit_threshold_steps)
+
+    # step or skip
+    if do_synced_step:
+        for opt in optimizers:
+            opt.step()
+    else:
+        # Skip optimizer to avoid collectives; still clear grads so they don't accumulate
+        if step == exit_threshold_steps - 1 and master_process:
+            print(f"[tiered-exit] rank {rank}: last unsynced warm step at global step {step}")
+    # In both cases, clear grads
     model.zero_grad(set_to_none=True)
+
+    # (Optional) small one-time log when this rank begins synced training
+    if TIERED_EXIT_ENABLE and step == exit_threshold_steps and master_process:
+        print(f"[tiered-exit] rank {rank}: starting synced training at global step {step}")
+
     # logging
     approx_training_time_ms = training_time_ms + 1000 * (time.perf_counter() - t0)
     print0(f"step:{step+1}/{train_steps} train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms/(step + 1):.2f}ms", console=True)
